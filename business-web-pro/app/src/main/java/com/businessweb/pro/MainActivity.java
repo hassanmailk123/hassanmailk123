@@ -3,17 +3,23 @@ package com.businessweb.pro;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.net.Uri;
 import android.net.http.SslError;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.RenderProcessGoneDetail;
 import android.webkit.SslErrorHandler;
@@ -31,23 +37,36 @@ import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
     private static final String HOME = "https://web.whatsapp.com/";
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int MEDIA_PERMISSION_REQUEST = 1002;
+    private static final int NOTIFICATION_PERMISSION_REQUEST = 1003;
+    private static final String MSG_CHANNEL = "business_web_messages";
+    private static final String CALL_CHANNEL = "business_web_calls";
+    private static final int MSG_NOTIFICATION_ID = 51;
+    private static final int CALL_NOTIFICATION_ID = 52;
 
     private FrameLayout root;
     private WebView webView;
     private ProgressBar progressBar;
     private ValueCallback<Uri[]> uploadCallback;
     private PermissionRequest pendingPermissionRequest;
+    private boolean isForeground = true;
+    private int lastUnread = 0;
+    private long lastCallAlertAt = 0L;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().setStatusBarColor(0xFF0B141A);
         getWindow().setNavigationBarColor(0xFF0B141A);
+        createNotificationChannels();
+        requestNotificationPermission();
+        startSessionService();
 
         root = new FrameLayout(this);
         setContentView(root);
@@ -75,8 +94,9 @@ public class MainActivity extends Activity {
             webView.stopLoading();
             webView.destroy();
         }
-
         webView = new WebView(this);
+        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        webView.setInitialScale(92);
         root.addView(webView, 0, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
@@ -88,15 +108,17 @@ public class MainActivity extends Activity {
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
-        settings.setUseWideViewPort(true);
-        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(false);
+        settings.setLoadWithOverviewMode(false);
         settings.setJavaScriptCanOpenWindowsAutomatically(true);
         settings.setSupportMultipleWindows(false);
         settings.setAllowContentAccess(true);
         settings.setAllowFileAccess(true);
+        settings.setLoadsImagesAutomatically(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setBuiltInZoomControls(false);
         settings.setDisplayZoomControls(false);
+        settings.setTextZoom(94);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setUserAgentString(makeDesktopUserAgent(settings.getUserAgentString()));
@@ -104,6 +126,8 @@ public class MainActivity extends Activity {
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);
         cookies.setAcceptThirdPartyCookies(webView, true);
+
+        webView.addJavascriptInterface(new NativeBridge(), "BusinessWebNative");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -126,6 +150,7 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
                 CookieManager.getInstance().flush();
+                injectMobileAndAlertBridge();
             }
 
             @Override
@@ -195,10 +220,140 @@ public class MainActivity extends Activity {
         });
     }
 
+    private void injectMobileAndAlertBridge() {
+        if (webView == null) return;
+        String js = "(function(){"
+                + "if(window.__BWP_V3)return;window.__BWP_V3=true;"
+                + "try{var m=document.querySelector('meta[name=viewport]');"
+                + "if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}"
+                + "m.content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no';}catch(e){}"
+                + "var lastTitle='';function titleChanged(){try{var t=document.title||'';"
+                + "if(t!==lastTitle){lastTitle=t;BusinessWebNative.onTitleChanged(t);}}catch(e){}}"
+                + "titleChanged();var titleNode=document.querySelector('title');"
+                + "if(titleNode)new MutationObserver(titleChanged).observe(titleNode,{childList:true,subtree:true,characterData:true});"
+                + "var callShown=false,timer=null;function checkCall(){timer=null;try{var ds=document.querySelectorAll('[role=dialog]');var txt='';"
+                + "for(var i=0;i<ds.length;i++){txt+=' '+(ds[i].innerText||'');}var low=txt.toLowerCase();"
+                + "var incoming=low.indexOf('incoming')>=0&&low.indexOf('call')>=0;"
+                + "if(incoming&&!callShown){callShown=true;BusinessWebNative.onIncomingCall();}"
+                + "else if(!incoming&&callShown){callShown=false;BusinessWebNative.onCallEnded();}}catch(e){}}"
+                + "new MutationObserver(function(){if(timer)clearTimeout(timer);timer=setTimeout(checkCall,350);})"
+                + ".observe(document.body,{childList:true,subtree:true});checkCall();"
+                + "})();";
+        webView.evaluateJavascript(js, null);
+    }
+
+    public class NativeBridge {
+        @JavascriptInterface
+        public void onTitleChanged(String title) {
+            runOnUiThread(() -> handleUnreadTitle(title));
+        }
+
+        @JavascriptInterface
+        public void onIncomingCall() {
+            runOnUiThread(MainActivity.this::showIncomingCallNotification);
+        }
+
+        @JavascriptInterface
+        public void onCallEnded() {
+            runOnUiThread(() -> {
+                NotificationManager manager = getSystemService(NotificationManager.class);
+                manager.cancel(CALL_NOTIFICATION_ID);
+            });
+        }
+    }
+
+    private void handleUnreadTitle(String title) {
+        int unread = parseUnreadCount(title);
+        if (unread > lastUnread && !isForeground) showMessageNotification(unread);
+        lastUnread = unread;
+    }
+
+    private int parseUnreadCount(String title) {
+        if (title == null) return 0;
+        Matcher m = Pattern.compile("\\((\\d+)\\)").matcher(title);
+        if (m.find()) {
+            try { return Integer.parseInt(m.group(1)); } catch (Exception ignored) {}
+        }
+        return 0;
+    }
+
+    private void showMessageNotification(int unread) {
+        Intent open = new Intent(this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent pending = PendingIntent.getActivity(
+                this, 1, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification notification = new Notification.Builder(this, MSG_CHANNEL)
+                .setSmallIcon(R.drawable.ic_launcher)
+                .setContentTitle("New WhatsApp Business message")
+                .setContentText(unread == 1 ? "1 unread chat" : unread + " unread chats")
+                .setCategory(Notification.CATEGORY_MESSAGE)
+                .setAutoCancel(true)
+                .setContentIntent(pending)
+                .build();
+        getSystemService(NotificationManager.class).notify(MSG_NOTIFICATION_ID, notification);
+    }
+
+    private void showIncomingCallNotification() {
+        long now = System.currentTimeMillis();
+        if (now - lastCallAlertAt < 8000) return;
+        lastCallAlertAt = now;
+        Intent open = new Intent(this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent pending = PendingIntent.getActivity(
+                this, 2, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification notification = new Notification.Builder(this, CALL_CHANNEL)
+                .setSmallIcon(R.drawable.ic_launcher)
+                .setContentTitle("Incoming WhatsApp call")
+                .setContentText("Tap to open Business Web Pro and answer")
+                .setCategory(Notification.CATEGORY_CALL)
+                .setPriority(Notification.PRIORITY_MAX)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setAutoCancel(true)
+                .setTimeoutAfter(60000)
+                .setContentIntent(pending)
+                .build();
+        getSystemService(NotificationManager.class).notify(CALL_NOTIFICATION_ID, notification);
+    }
+
+    private void createNotificationChannels() {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        NotificationChannel messages = new NotificationChannel(
+                MSG_CHANNEL, "WhatsApp messages", NotificationManager.IMPORTANCE_HIGH);
+        messages.setDescription("Message alerts from the active linked WhatsApp Web session");
+        messages.enableVibration(true);
+        manager.createNotificationChannel(messages);
+
+        NotificationChannel calls = new NotificationChannel(
+                CALL_CHANNEL, "WhatsApp calls", NotificationManager.IMPORTANCE_HIGH);
+        calls.setDescription("Incoming call alerts exposed by the linked WhatsApp Web session");
+        calls.enableVibration(true);
+        manager.createNotificationChannel(calls);
+    }
+
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION_REQUEST);
+        }
+    }
+
+    private void startSessionService() {
+        try {
+            Intent service = new Intent(this, KeepAliveService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(service);
+            else startService(service);
+        } catch (Throwable ignored) {}
+    }
+
     private boolean handleNavigation(Uri uri) {
         String scheme = uri.getScheme();
-        if (scheme == null || "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
-            return false;
+        if (scheme == null) return false;
+        if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
+            String host = uri.getHost();
+            if (host != null && (host.equals("whatsapp.com") || host.endsWith(".whatsapp.com"))) return false;
+            try { startActivity(new Intent(Intent.ACTION_VIEW, uri)); }
+            catch (Exception ignored) { Toast.makeText(this, "No app can open this link.", Toast.LENGTH_SHORT).show(); }
+            return true;
         }
         try {
             Intent intent = "intent".equalsIgnoreCase(scheme)
@@ -218,7 +373,6 @@ public class MainActivity extends Activity {
             request.deny();
             return;
         }
-
         pendingPermissionRequest = request;
         List<String> missing = new ArrayList<>();
         for (String resource : request.getResources()) {
@@ -328,6 +482,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        isForeground = true;
         if (webView != null) {
             webView.onResume();
             webView.resumeTimers();
@@ -336,7 +491,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
-        if (webView != null) webView.onPause();
+        isForeground = false;
         CookieManager.getInstance().flush();
         super.onPause();
     }
@@ -344,7 +499,7 @@ public class MainActivity extends Activity {
     @Override
     public void onBackPressed() {
         if (webView != null && webView.canGoBack()) webView.goBack();
-        else super.onBackPressed();
+        else moveTaskToBack(true);
     }
 
     @Override
@@ -362,11 +517,12 @@ public class MainActivity extends Activity {
             if (parent != null) parent.removeView(webView);
             webView.stopLoading();
             webView.loadUrl("about:blank");
-            webView.clearHistory();
+            webView.removeJavascriptInterface("BusinessWebNative");
             webView.removeAllViews();
             webView.destroy();
             webView = null;
         }
+        try { stopService(new Intent(this, KeepAliveService.class)); } catch (Throwable ignored) {}
         super.onDestroy();
     }
 }
