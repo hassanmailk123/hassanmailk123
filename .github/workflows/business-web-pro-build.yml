@@ -32,7 +32,15 @@ jobs:
           unzip -t business-web-pro/dist/Business-Web-Pro-v2.apk
           sha256sum business-web-pro/dist/Business-Web-Pro-v2.apk > business-web-pro/dist/SHA256.txt
           stat -c '%s bytes' business-web-pro/dist/Business-Web-Pro-v2.apk > business-web-pro/dist/SIZE.txt
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Business-Web-Pro-v2
+          path: business-web-pro/dist/Business-Web-Pro-v2.apk
+          if-no-files-found: error
+          retention-days: 1
       - name: Commit APK
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
