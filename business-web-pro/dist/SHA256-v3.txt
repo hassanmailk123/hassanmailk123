@@ -1,1 +1,1 @@
-07485eb022ccafe9f038d1be7f702db565c3a90c9bb9dad6f29b3c9bde7f49e4  business-web-pro/dist/Business-Web-Pro-v3.apk
+13fc75cfd78bbf833ec408bba138422efac3354b9991b8205b5cb32d1da1ba3a  business-web-pro/dist/Business-Web-Pro-v3.apk
